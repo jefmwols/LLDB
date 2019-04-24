@@ -28,10 +28,10 @@ from stat import *
 
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand(
-        'command script add -f generate_new_script.generate_new_script __generate_script')
+        'command script add -f generate_new_script.generate_new_script __generate_script -h "generates new LLDB script"')
 
 
-def generate_new_script(debugger, command, result, internal_dict):
+def generate_new_script(debugger, command, exe_ctx, result, internal_dict):
     '''
     Generates a new script in the same directory as this file.
     Can generate function styled scripts or class styled scripts.
@@ -143,10 +143,10 @@ import optparse
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand(
     '''
-    script += '\'command script add -f {}.handle_command {}\')'.format(filename, resolved_name)
+    script += '\'command script add -f {}.handle_command {} -h "{}"\')'.format(filename, resolved_name, "Short documentation here")
     script += r'''
 
-def handle_command(debugger, command, result, internal_dict):
+def handle_command(debugger, command, exe_ctx, result, internal_dict):
     ''' 
     script += "\'\'\'\n    Documentation for how to use " + resolved_name + " goes here \n    \'\'\'"
     

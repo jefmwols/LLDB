@@ -29,10 +29,10 @@ import lldb.utils.symbolication
 
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand(
-        'command script add -f sclass.sclass sclass')
+        'command script add -f sclass.sclass sclass -h "Swizzle class helper"')
 
 
-def sclass(debugger, command, result, internal_dict):
+def sclass(debugger, command, exe_ctx, result, internal_dict):
     '''
     Swizzle Class. Generates a NSObject category file 
     that swizzles the class that you supply. 
@@ -71,11 +71,11 @@ Examples:
     res = lldb.SBCommandReturnObject()
     interpreter = debugger.GetCommandInterpreter()
 
-    interpreter.HandleCommand('expression -lobjc -O -- @import Foundation', res)
-    interpreter.HandleCommand('expression -lobjc -O -- @import ObjectiveC', res)
+    # interpreter.HandleCommand('expression -lobjc -O -- @import Foundation', res)
+    # interpreter.HandleCommand('expression -lobjc -O -- @import ObjectiveC', res)
     res.Clear()
 
-    target = debugger.GetSelectedTarget()
+    target = exe_ctx.target
     interpreter.HandleCommand('expression -lobjc -O -- (Class)NSClassFromString(@\"{}\")'.format(clean_command), res)
     if 'nil' in res.GetOutput():
         result.SetError('Can\'t find class named "{}". Womp womp...'.format(clean_command))
@@ -91,8 +91,22 @@ Examples:
         return
     contents = generate_swizzle_block(clean_command) + res.GetOutput()
 
+    if options.copy_compile:
+        if 'x86_64h-apple-ios' in target.GetTriple():
+            archType = '-sdk iphonesimulator'
+        elif 'arm64' in target.GetTriple():
+            archType = '-sdk iphoneos'
+        else:
+            archType = ''
+
+
+        compileString = 'clang {} -dynamiclib -Wl, -isysroot `xcrun --show-sdk-path {}` -framework Foundation -framework UIKit -framework QuartzCore -o /tmp/a.dylib && codesign --force --sign - /tmp/a.dylib'.format(filepath, archType)
+        os.system('echo "{}" | pbcopy'.format(compileString))
+        result.AppendMessage('Copying build command to clipboard')
+        contents = '/*\n{}\n*/\n\n'.format(compileString) + contents
+
     create_or_touch_filepath(filepath, contents)
-    print('Written output to: ' + filepath + '... opening file')
+    result.AppendMessage('Written output to: ' + filepath + '... opening file')
     os.system('open -R ' + filepath)
 
 
@@ -153,7 +167,7 @@ def generate_header_script(options, class_to_generate_header):
 
   typedef struct objc_method *Method;
   typedef struct objc_ivar *Ivar;
-  typedef struct objc_category *Category;
+  // typedef struct objc_category *Category;
   typedef struct objc_property *objc_property_t;
   
   NSString *randString = @"''' + class_to_generate_header + r'''";
@@ -208,6 +222,14 @@ def generate_header_script(options, class_to_generate_header):
     if options.method:
         script += r'if (!(BOOL)[methodName isEqualToString:@"' + options.method + '"]) { continue; }'
 
+    if options.regex_method:
+        script += 'NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"{}" options:0 error:nil];'.format(options.regex_method)
+        script += r'''
+    NSUInteger matches = (NSUInteger)[regex numberOfMatchesInString:methodName options:0 range:NSMakeRange(0, [methodName length])];
+    if (matches == 0) {
+      continue;
+    }'''
+
     script += r''' 
       if([blackListMethodNames containsObject:methodName]) {
         continue;
@@ -221,7 +243,7 @@ def generate_header_script(options, class_to_generate_header):
       [swizzledImplementationsString appendString:methodName];
       [swizzledImplementationsString appendString:@"\", "];
       
-      if (class_isMetaClass(cls)) {
+      if ((BOOL)class_isMetaClass(cls)) {
         [swizzledImplementationsString appendString:@"YES"];
       } else {
         [swizzledImplementationsString appendString:@"NO"];
@@ -383,4 +405,16 @@ def generate_option_parser():
                       default=None,
                       dest="method",
                       help="Instead of dumping all the functions only specify a module, expects Selector style input")
+
+    parser.add_option("-c", "--copy_compile",
+                      action="store_true",
+                      default=False,
+                      dest="copy_compile",
+                      help="Copy the compile command to compile the category to the clipboard")
+
+    parser.add_option("-r", "--regex_method",
+                      action="store",
+                      default=None,
+                      dest="regex_method",
+                      help="Only generate methods to swizzle based upon a regex expression")
     return parser

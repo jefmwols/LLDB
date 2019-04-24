@@ -30,10 +30,10 @@ from stat import *
 
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand(
-        'command script add -f pmodule.pmodule pmodule')
+        'command script add -f pmodule.pmodule pmodule -h "Generates DTrace script to profile module"')
 
 
-def pmodule(debugger, command, result, internal_dict):
+def pmodule(debugger, command, exe_ctx, result, internal_dict):
     '''Creates a custom dtrace script that profiles modules in an executable
     based upon its memory layout and ASLR. Provide no arguments w/ '-a' if 
     you want a count of all the modules firing. Provide a module if you want 
@@ -58,21 +58,26 @@ def pmodule(debugger, command, result, internal_dict):
 
     command_args = shlex.split(command)
     parser = generate_option_parser()
-    target = debugger.GetSelectedTarget()
+    target = exe_ctx.target
     try:
         (options, args) = parser.parse_args(command_args)
     except:
         result.SetError("option parsing failed")
         return
-    pid = target.process.id
+    pid = exe_ctx.process.id
 
-    # module_parirs = get_module_pair(, debugger)
+    # module_parirs = get_module_pair(, target)
     is_cplusplus = options.non_objectivec
     if not args and not (options.all_modules or options.all_modules_output):
         result.SetError('Need a module or use the -a option. You can list all modules by "image list -b"')
         return
 
-    dtrace_script = generate_dtrace_script(debugger, options, args)
+    dtrace_script = generate_dtrace_script(target, options, args)
+    if options.debug:
+        source = '\n'.join(['# '+ format(idx + 1, '2') +': ' + line for idx, line in enumerate(dtrace_script.split('\n'))]) 
+
+        result.AppendMessage(source)
+        return
 
     filename = '/tmp/lldb_dtrace_pmodule'
     create_or_touch_filepath(filename, dtrace_script)
@@ -88,9 +93,17 @@ def pmodule(debugger, command, result, internal_dict):
     
     result.SetStatus(lldb.eReturnStatusSuccessFinishNoResult)
 
-def generate_conditional_for_module_name(module_name, debugger):
-    pair = get_module_pair(module_name, debugger)
-    template = '/ {} <= uregs[R_PC] && uregs[R_PC] <= {} /\n'
+def generate_conditional_for_module_name(module_name, target, options):
+    pair = get_module_pair(module_name, target)
+    if not options.non_objectivec and options.root_function:
+        template = '/ ({0} > *(uintptr_t *)copyin(uregs[R_SP], sizeof(uintptr_t)) || *(uintptr_t *)copyin(uregs[R_SP], sizeof(uintptr_t)) > {1}) && {0} <= uregs[R_PC] && uregs[R_PC] <= {1} /\n'
+    elif options.non_objectivec and not options.root_function:
+        template = '\n'
+    elif not options.non_objectivec and not options.root_function:
+        template = '/ {0} <= uregs[R_PC] && uregs[R_PC] <= {1} /\n'
+    elif options.non_objectivec and options.root_function:
+        template = '/ ({0} > *(uintptr_t *)copyin(uregs[R_SP], sizeof(uintptr_t)) || *(uintptr_t *)copyin(uregs[R_SP], sizeof(uintptr_t)) > {1}) /\n'
+
     return template.format(pair[0], pair[1])
 
 
@@ -121,8 +134,7 @@ def create_or_touch_filepath(filepath, dtrace_script):
     os.chmod(filepath, st.st_mode | S_IEXEC)
     file.close()
 
-def generate_dtrace_script(debugger, options, args):
-    target = debugger.GetSelectedTarget()
+def generate_dtrace_script(target, options, args):
     is_cplusplus = options.non_objectivec
     dtrace_script = '''#!/usr/sbin/dtrace -s
 #pragma D option quiet
@@ -136,7 +148,9 @@ dtrace:::BEGIN
 {{
     printf("Starting... Hit Ctrl-C to end. Observing {} functions in {}\\n");
 }}
-'''.format('non-Objective-C' if is_cplusplus else 'Objective-C', (', ').join(args))
+'''.format('straight up, normal' if is_cplusplus else 'Objective-C', (', ').join(args))
+
+    dtrace_template = ''
 
 
     pid = target.process.id
@@ -150,11 +164,13 @@ dtrace:::BEGIN
         else:
             dtrace_script += query_template.format('objc', '')
 
-        if options.all_modules_output:
+        if options.all_modules_output and not options.non_objectivec:
              dtrace_script += '{\nprintf("0x%012p %c[%s %s]\\n", uregs[R_RDI], probefunc[0], probemod, (string)&probefunc[1]);\n}'
+        elif options.all_modules_output and options.non_objectivec:
+             dtrace_script += '{\nprintf("0x%012p %s, %s\\n", uregs[R_RDI], probemod, probefunc);\n}'
         else:
             dtrace_script += '{\nprogram_counter = uregs[R_PC];\nthis->method_counter = \"Unknown\";' # TODO 64 only change to universal arch
-            dtrace_template = "this->method_counter = {} <= program_counter && program_counter <= {} ? \"{}\" : this->method_counter;\n"
+            dtrace_template += "this->method_counter = {} <= program_counter && program_counter <= {} ? \"{}\" : this->method_counter;\n"
             dtrace_template = textwrap.dedent(dtrace_template)
 
             for module in target.modules:
@@ -170,14 +186,16 @@ dtrace:::BEGIN
     else:
         for module_name in args:
 
+            # uregs[R_RDI]
             # Objective-C logic:        objc$target:::entry / {} <= uregs[R_PC] && uregs[R_PC] <= {} / { }
             if not is_cplusplus:
                 dtrace_script += query_template.format('objc', '')
-                dtrace_script += generate_conditional_for_module_name(module_name, debugger)
+                dtrace_script += generate_conditional_for_module_name(module_name, target, options)
 
             # Non-Objective-C logic:    pid$target:Module::entry { }
             if is_cplusplus:
                 dtrace_script += query_template.format('pid', module_name)
+                dtrace_script += generate_conditional_for_module_name(module_name, target, options)
                 dtrace_script += '{\n    printf("[%s] %s\\n", probemod, probefunc);\n'
             else:
                 dtrace_script += '{\n    printf("0x%012p %c[%s %s]\\n", uregs[R_RDI], probefunc[0], probemod, (string)&probefunc[1]);\n'
@@ -188,12 +206,11 @@ dtrace:::BEGIN
 
             dtrace_script += '}\n'
 
+
     return dtrace_script
 
 
-def get_module_pair(module_name, debugger):
-    target = debugger.GetSelectedTarget()
-
+def get_module_pair(module_name, target):
     module = target.FindModule(lldb.SBFileSpec(module_name))
     if not module.file.exists:
         result.SetError(
@@ -233,9 +250,21 @@ def generate_option_parser():
                       dest="all_modules_output",
                       help="Dumps EVERYTHING. Only execute single commands with this one in lldb")
 
+    parser.add_option("-r", "--root_function",
+                      action="store_true",
+                      default=False,
+                      dest="root_function",
+                      help="Only prints the root functions if it's called from another module")
+
     parser.add_option("-f", "--flow_indent",
                       action="store_true",
                       default=False,
                       dest="flow_indent",
                       help="Adds the flow indent flag")
+
+    parser.add_option("-g", "--debug",
+                      action="store_true",
+                      default=False,
+                      dest="debug",
+                      help="Doesn't copy the script, just prints it out to stderr")
     return parser
